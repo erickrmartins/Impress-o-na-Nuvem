@@ -1,0 +1,155 @@
+COMO CONFIGURAR
+================
+
+** IMPORTANTE se você já usava uma versão anterior deste programa: **
+O programa agora também move etiquetas antigas para a lixeira do Drive,
+o que exige uma permissão maior do que antes (antes era só leitura).
+Se você já tinha um arquivo token.json gerado, apague-o antes de rodar
+o programa de novo — ele vai pedir login no navegador outra vez, dessa
+vez pedindo a permissão de leitura/escrita. Isso só acontece uma vez.
+
+1) Google Drive API
+   - Acesse https://console.cloud.google.com/
+   - Crie um projeto (ou use um existente)
+   - Ative a "Google Drive API"
+   - Vá em "Credenciais" > "Criar credenciais" > "ID do cliente OAuth"
+   - Tipo de aplicativo: "Aplicativo para computador"
+   - Baixe o arquivo JSON e renomeie para credentials.json
+   - Coloque credentials.json na mesma pasta do script
+
+1b) Colocar a tela de consentimento OAuth em "Produção"
+   - No Google Cloud Console, vá em "Tela de consentimento OAuth"
+   - Mude o "Status de publicação" de "Teste" para "Em produção"
+   - Isso é importante: enquanto o app estiver em modo "Teste", o Google
+     expira o acesso automaticamente a cada 7 dias e o programa para de
+     funcionar até alguém logar de novo manualmente
+   - Ao colocar em produção, vai aparecer um aviso de "app não verificado"
+     na hora do login — é normal, clique em "Continuar" / "Ir para o app
+     (não seguro)". Não é necessário passar pela verificação formal do
+     Google para esse tipo de uso pessoal
+
+2) Descobrir o ID da pasta do Drive
+   - Abra a pasta com as etiquetas no navegador
+   - O ID é o trecho da URL depois de /folders/
+     Ex: drive.google.com/drive/folders/1AbCDefGhIJKlmNoPQrs
+     -> ID = 1AbCDefGhIJKlmNoPQrs
+
+3) Instalar Python (se ainda não tiver)
+   - https://www.python.org/downloads/ (marque "Add to PATH" na instalação)
+
+4) Instalar as dependências Python
+   Abra o terminal (cmd/PowerShell) na pasta do projeto e rode:
+   pip install -r requirements.txt
+
+5) Instalar o SumatraPDF (usado para imprimir em silêncio)
+   - https://www.sumatrapdfreader.org/download-free-pdf-reader
+   - Baixe a versão "portable" ou instale normalmente
+   - Anote o caminho do SumatraPDF.exe
+
+6) Descobrir o nome exato da sua impressora térmica
+   - Painel de Controle > Dispositivos e Impressoras
+   - Copie o nome exatamente como aparece
+
+7) Configurar o tamanho da etiqueta (10x15cm)
+   - Painel de Controle > Dispositivos e Impressoras
+   - Clique com o botão direito na impressora térmica > Preferências de impressão
+   - Defina o tamanho do papel como 10x15cm (ou o nome que o driver usar,
+     ex: "4x6 in", "100x150mm") como padrão
+   Isso garante que toda impressão já sai no tamanho certo, sem precisar
+   configurar nada no programa.
+
+8) Rodar o programa com interface gráfica
+   python imprimir_etiquetas_gui.py
+
+   Na janela que abrir:
+   - Preencha o ID da pasta e o nome da impressora
+   - Clique em "Salvar configuração"
+   - Clique em "▶ Iniciar"
+
+   Na primeira vez que iniciar, vai abrir o navegador pedindo para você
+   autorizar o acesso ao Google Drive (só acontece uma vez).
+
+   A bolinha de status fica:
+   - Cinza = parado
+   - Laranja = conectando
+   - Verde = monitorando normalmente
+   - Vermelha = erro de conexão
+
+   O log na parte de baixo mostra em tempo real cada arquivo novo
+   encontrado, baixado e impresso.
+
+9) Configurar num computador diferente do que vai rodar o programa
+   (ou com uma conta Google diferente de quem vai operar)
+
+   O que importa não é o computador, e sim quem faz o login na tela de
+   autorização do navegador (passo 8) — é essa conta que define qual
+   Google Drive o programa enxerga.
+
+   - Faça a configuração inteira (passos 1 a 8) usando a conta Google
+     que é DONA da pasta de etiquetas no Drive, mesmo que seja feita
+     num computador diferente do que vai rodar o programa depois
+   - Isso vai gerar dois arquivos na pasta do projeto: credentials.json
+     e token.json
+   - Copie a pasta inteira do projeto (incluindo esses dois arquivos)
+     para o computador que vai efetivamente rodar o programa
+   - Nesse computador de destino, ao rodar imprimir_etiquetas_gui.py,
+     o programa encontra o token.json já autorizado e NÃO pede login
+     de novo — só a pessoa que configurou precisou logar, uma vez
+   - Quem for operar o computador servidor não precisa ter conta
+     Google nenhuma nisso — só executa o programa
+
+10) Configurar notificação de falha por e-mail (Gmail)
+   - Ative a verificação em 2 etapas na sua conta Google, se ainda não tiver:
+     myaccount.google.com/security
+   - Depois, gere uma "senha de app" em:
+     myaccount.google.com/apppasswords
+   - Na interface do programa, marque "Avisar por e-mail (Gmail)" e
+     preencha: seu e-mail Gmail (remetente), a senha de app gerada, e o
+     e-mail que deve receber os avisos (pode ser o mesmo)
+   - Clique em "Salvar configuração"
+   - O programa manda um e-mail automaticamente se: falhar ao conectar
+     no Drive, falhar ao consultar a pasta, ou falhar ao imprimir um PDF
+   - Para evitar spam, ele espera pelo menos 15 minutos entre um aviso
+     e outro, mesmo que o erro continue acontecendo
+
+11) Configurar notificação de falha por WhatsApp (CallMeBot, grátis)
+   - No WhatsApp do seu celular, adicione o número do bot do CallMeBot
+     como contato (veja o número atual em callmebot.com/whatsapp)
+   - Envie para esse contato a mensagem: "I allow callmebot to send me
+     messages"
+   - Aguarde a resposta do bot com sua apikey (pode levar alguns minutos)
+   - Na interface do programa, marque "Avisar por WhatsApp (CallMeBot)"
+     e preencha seu telefone (com código do país, ex: 5532999999999,
+     sem espaços ou símbolos) e a apikey recebida
+   - Clique em "Salvar configuração"
+   - Observações: é um serviço gratuito não-oficial, indicado só para
+     uso pessoal (não envia mensagens para clientes); ocasionalmente
+     pode ficar com inscrições temporariamente lotadas
+
+12) Iniciar automaticamente com o Windows
+   - Na interface do programa, marque "Iniciar automaticamente com o
+     Windows" e clique em "Salvar configuração"
+   - Isso cria um atalho na pasta de inicialização do Windows apontando
+     para o programa; ele vai abrir sozinho toda vez que o computador ligar
+   - Para desativar, desmarque a opção e salve de novo
+
+13) Limpeza automática de etiquetas antigas
+   - Na aba Configurações, marque "Excluir etiquetas antigas já
+     impressas" e defina depois de quantos dias sem modificação uma
+     etiqueta deve ser removida (padrão: 5 dias)
+   - A cada verificação, o programa checa a data da última modificação
+     de cada etiqueta no Drive; se já foi impressa por este programa E
+     passou do prazo, ele:
+       - apaga o PDF da pasta local etiquetas_baixadas
+       - move o arquivo original para a lixeira do Google Drive
+         (fica recuperável por 30 dias, não é excluído para sempre)
+   - Uma etiqueta que ainda NÃO foi impressa nunca é apagada, mesmo que
+     tenha mais de 5 dias — a limpeza só vale para o que já foi processado
+   - Para desativar completamente, desmarque a opção e salve
+
+OBSERVAÇÕES
+===========
+- Existe também o script imprimir_etiquetas.py (sem interface, roda só
+  no terminal), caso prefira usar assim — mas ele não tem as notificações
+  de falha, o início automático nem a limpeza automática, que só existem
+  na versão com interface (imprimir_etiquetas_gui.py).

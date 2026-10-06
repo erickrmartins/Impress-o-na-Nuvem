@@ -179,6 +179,7 @@ def desativar_inicio_com_windows():
 COR_FUNDO = "#f4f5f3"          # --color-main-bg
 COR_CARD = "#ffffff"           # --color-card-bg
 COR_CARD_BRILHO = "#e8eef0"    # --color-tint
+COR_CARD_HOVER = "#edf1f2"   # hover claro: reduz apenas parte do brilho
 COR_TEXTO = "#164a68"          # --color-card-text-main
 COR_TEXTO_MUTED = "#46515a"    # --color-card-text-sec
 COR_BORDA = "rgba(31, 42, 51, 0.09)" # Como o Tkinter não aceita rgba direto, usamos um equivalente opaco equivalente (ex: #e6e8ea) ou ajustado para a borda:
@@ -353,45 +354,65 @@ def aplicar_efeito_vidro(janela):
 
 
 class CardEspelhado(tk.Frame):
-    """Card fosco, borda clara e brilho no topo (vidro)."""
+    """Card fosco com decoração em Canvas e conteúdo desacoplado do tamanho solicitado."""
 
     def __init__(self, parent, raio=RAIO_CARD, **kwargs):
-        super().__init__(parent, bg=COR_FUNDO, **kwargs)
+        super().__init__(parent, bg=COR_FUNDO, height=60, **kwargs)
         self.raio = raio
+        self.pack_propagate(False)
+
         self.canvas = tk.Canvas(self, bg=COR_FUNDO, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
+
         self.inner = tk.Frame(self.canvas, bg=COR_CARD)
-        self._janela = self.canvas.create_window(14, 14, window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", self._redesenhar)
+        # O conteúdo é posicionado, em vez de create_window(), para que o
+        # requested width dos widgets internos nunca aumente o próprio card.
+        self.inner.place(x=16, y=14, relwidth=1.0, width=-32, anchor="nw")
+
         self.bind("<Configure>", self._redesenhar)
-        self._ultima_medida = (0, 0)
+        self.inner.bind("<Configure>", self._redesenhar)
+        self._redesenhando = False
+        self.after_idle(self._redesenhar)
 
     def _redesenhar(self, event=None):
-        self.update_idletasks()
-        largura = max(self.winfo_width(), 48)
-        altura_inner = max(self.inner.winfo_reqheight(), 24)
-        altura = altura_inner + 28
-        medida = (largura, altura)
-        if medida == self._ultima_medida and self.canvas.find_withtag("shape"):
+        if self._redesenhando:
             return
-        self._ultima_medida = medida
-        self.canvas.config(width=largura, height=altura)
-        self.canvas.delete("shape")
-        _desenhar_retangulo_arredondado(
-            self.canvas, 2, 2, largura - 3, altura - 3,
-            self.raio, COR_CARD, COR_BORDA, 1,
-        )
-        brilho_h = min(36, max(20, altura // 3))
-        _desenhar_retangulo_arredondado(
-            self.canvas, 3, 3, largura - 4, 3 + brilho_h,
-            self.raio - 3, COR_CARD_BRILHO, COR_CARD_BRILHO, 0,
-        )
-        self.canvas.create_line(
-            22, 3, largura - 22, 3, fill=COR_BORDA_BRILHO, width=1, tags="shape",
-        )
-        self.canvas.coords(self._janela, 16, 14)
-        self.canvas.itemconfig(self._janela, width=max(largura - 32, 20))
-        self.canvas.tag_lower("shape")
+        self._redesenhando = True
+        try:
+            self.update_idletasks()
+
+            # A altura depende do conteúdo; a largura pertence exclusivamente
+            # ao geometry manager do pai. Isso elimina a realimentação que fazia
+            # o card conservar a largura antiga depois de um resize para baixo.
+            largura = max(self.winfo_width(), 48)
+            altura = max(self.inner.winfo_reqheight() + 28, 28)
+
+            if self.winfo_height() != altura:
+                self.configure(height=altura)
+
+            self.canvas.configure(width=largura, height=altura)
+            self.inner.place_configure(
+                x=16, y=14, width=max(largura - 32, 20),
+                height=max(altura - 28, 1),
+            )
+
+            self.canvas.delete("shape")
+            _desenhar_retangulo_arredondado(
+                self.canvas, 2, 2, max(largura - 3, 3), max(altura - 3, 3),
+                self.raio, COR_CARD, COR_BORDA, 1,
+            )
+            brilho_h = min(36, max(20, altura // 3))
+            _desenhar_retangulo_arredondado(
+                self.canvas, 3, 3, max(largura - 4, 4), 3 + brilho_h,
+                max(self.raio - 3, 1), COR_CARD_BRILHO, COR_CARD_BRILHO, 0,
+            )
+            self.canvas.create_line(
+                22, 3, max(largura - 22, 22), 3,
+                fill=COR_BORDA_BRILHO, width=1, tags="shape",
+            )
+            self.canvas.tag_lower("shape")
+        finally:
+            self._redesenhando = False
 
 
 class BotaoArredondado(tk.Canvas):
@@ -424,7 +445,9 @@ class BotaoArredondado(tk.Canvas):
         if self.primario:
             fundo = COR_ACCENT_HOVER if self._hover else COR_ACCENT
             return fundo, COR_ACCENT_FG
-        fundo = "#3a3a46" if self._hover else COR_CARD_BRILHO
+        # Botões secundários são claros na aba de configurações; no hover
+        # apenas reduza o brilho, sem transformá-los em um botão escuro.
+        fundo = COR_CARD_HOVER if self._hover else COR_CARD_BRILHO
         return fundo, COR_TEXTO
 
     def _desenhar(self):
@@ -1101,12 +1124,38 @@ class App(tk.Tk):
         self._tray_thread = None
         self._janela_oculta = False
         self.protocol("WM_DELETE_WINDOW", self._fechar_janela)
+        self._resize_job = None
+        self.bind("<Configure>", self._janela_redimensionada)
 
         self._configurar_estilo()
         self._montar_interface()
         self._atualizar_contador_hoje()
         self.after(200, self._processar_eventos)
         self.after(80, lambda: aplicar_efeito_vidro(self))
+
+    def _janela_redimensionada(self, event=None):
+        """Propaga o resize para os canvases/cards após o geometry manager estabilizar."""
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after_idle(self._aplicar_resize)
+
+    def _aplicar_resize(self):
+        self._resize_job = None
+        try:
+            self.update_idletasks()
+            self._desenhar_abas()
+            for frame in self._abas.values():
+                for widget in frame.winfo_children():
+                    if isinstance(widget, CardEspelhado):
+                        widget._redesenhar()
+            self.fundo.event_generate("<Configure>")
+        except tk.TclError:
+            pass
 
     def _iniciar_tray(self):
         if pystray is None or self._tray_icon is not None:

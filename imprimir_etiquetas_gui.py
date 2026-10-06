@@ -16,6 +16,8 @@ import queue
 import socket
 import smtplib
 import ssl
+import logging
+import re
 import urllib.request
 import urllib.parse
 import threading
@@ -27,6 +29,7 @@ from email.mime.text import MIMEText
 from tkinter import ttk, messagebox
 from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError, GoogleAuthError
@@ -36,6 +39,14 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
 # Escopo "drive" (leitura/escrita) é necessário para mover arquivos
 # antigos para a lixeira. Se você já tinha um token.json gerado com o
 # escopo antigo (só leitura), apague-o e autorize de novo.
@@ -44,7 +55,45 @@ DOWNLOAD_DIR = Path("etiquetas_baixadas")
 HISTORICO_PATH = Path("historico_impressoes.json")
 CONFIG_PATH = Path("config.json")
 TOKEN_PATH = Path("token.json")
+LOG_PATH = Path("app.log")
+TIMEOUT_IMPRESSAO_SEGUNDOS = 120
+TIMEOUT_OAUTH_SEGUNDOS = 180
+TIMEOUT_SMTP_SEGUNDOS = 20
+
+
+def _configurar_logger():
+    logger = logging.getLogger("etiquetas")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = RotatingFileHandler(
+            LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(handler)
+    return logger
+
+
+LOGGER = _configurar_logger()
+def _opcoes_processo_sem_janela():
+    """kwargs extras para subprocess.run que evitam o flash de uma janela
+    de prompt de comando no Windows a cada chamada do SumatraPDF."""
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        return {
+            "startupinfo": startupinfo,
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+        }
+    return {}
+
+
 POLL_INTERVAL_SECONDS = 30
+MAX_BACKOFF_SEGUNDOS = 15 * 60  # teto do backoff exponencial em caso de HTTP 429
+MAX_TENTATIVAS_EXCLUSAO = 3  # desiste de mover um arquivo pra lixeira após N falhas
 
 MENSAGEM_CREDENCIAL_EXPIRADA = (
     "Credencial do Google Drive expirada ou inválida. "
@@ -433,25 +482,159 @@ class Interruptor(tk.Frame):
         self.canvas.create_oval(cx - 7, 5, cx + 7, 19, fill=COR_CARD if ligado else COR_CARD, outline="")
 
 
+def _dpapi_criptografar(texto):
+    """Protege um segredo usando Windows DPAPI, vinculado ao usuário atual."""
+    if not texto:
+        return ""
+    if os.name != "nt":
+        raise RuntimeError("A proteção local de credenciais desta versão exige Windows.")
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    dados = texto.encode("utf-8")
+    buffer = (ctypes.c_ubyte * len(dados))(*dados)
+    entrada = DATA_BLOB(len(dados), buffer)
+    saida = DATA_BLOB()
+    crypt = ctypes.windll.crypt32.CryptProtectData
+    crypt.argtypes = [ctypes.POINTER(DATA_BLOB), wintypes.LPCWSTR, ctypes.POINTER(DATA_BLOB),
+                      wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(DATA_BLOB)]
+    crypt.restype = wintypes.BOOL
+    if not crypt(ctypes.byref(entrada), "Etiquetas", None, None, None, 0, ctypes.byref(saida)):
+        raise ctypes.WinError()
+    try:
+        bruto = ctypes.string_at(saida.pbData, saida.cbData)
+        return "DPAPI:" + __import__("base64").b64encode(bruto).decode("ascii")
+    finally:
+        ctypes.windll.kernel32.LocalFree(saida.pbData)
+
+
+def _dpapi_descriptografar(valor):
+    if not valor:
+        return ""
+    if not isinstance(valor, str) or not valor.startswith("DPAPI:"):
+        # Compatibilidade: configurações antigas em texto simples são lidas normalmente
+        # e serão protegidas na próxima gravação.
+        return valor
+    if os.name != "nt":
+        raise RuntimeError("Não é possível descriptografar credenciais DPAPI fora do Windows.")
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    bruto = __import__("base64").b64decode(valor[6:].encode("ascii"))
+    buffer = (ctypes.c_ubyte * len(bruto))(*bruto)
+    entrada = DATA_BLOB(len(bruto), buffer)
+    saida = DATA_BLOB()
+    crypt = ctypes.windll.crypt32.CryptUnprotectData
+    crypt.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(DATA_BLOB),
+                      wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(DATA_BLOB)]
+    crypt.restype = wintypes.BOOL
+    if not crypt(ctypes.byref(entrada), None, None, None, None, 0, ctypes.byref(saida)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(saida.pbData, saida.cbData).decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(saida.pbData)
+
+
+def _proteger_segredos_config(config):
+    protegido = dict(config)
+    for chave in ("notif_email_senha_app", "notif_whatsapp_apikey"):
+        valor = protegido.get(chave, "")
+        if valor and not str(valor).startswith("DPAPI:"):
+            protegido[chave] = _dpapi_criptografar(str(valor))
+    return protegido
+
+
+def _desproteger_segredos_config(config):
+    dados = dict(config)
+    for chave in ("notif_email_senha_app", "notif_whatsapp_apikey"):
+        dados[chave] = _dpapi_descriptografar(dados.get(chave, ""))
+    return dados
+
+
+def _registrar_log(nivel, mensagem):
+    getattr(LOGGER, nivel, LOGGER.info)(str(mensagem))
+
+
+def _validar_email(valor):
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", valor or ""))
+
+
+def _validar_telefone_callmebot(valor):
+    return bool(re.fullmatch(r"\d{10,15}", valor or ""))
+
+
+def _ler_json_seguro(caminho: Path, tipo_padrao):
+    """Lê um JSON sem derrubar o app se o arquivo estiver corrompido.
+    Em caso de erro, renomeia o arquivo problemático para .corrompido
+    (preservando o conteúdo pra inspeção manual) e devolve o padrão."""
+    if not caminho.exists():
+        return tipo_padrao()
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        try:
+            backup = caminho.with_suffix(caminho.suffix + ".corrompido")
+            caminho.replace(backup)
+        except OSError:
+            pass
+        return tipo_padrao()
+    return dados if isinstance(dados, type(tipo_padrao())) else tipo_padrao()
+
+
+def _escrever_json_atomico(caminho: Path, dados):
+    """Escreve em um arquivo .tmp e só então substitui o arquivo final via
+    os.replace (atômico no Windows), pra nunca deixar um JSON truncado se
+    o processo for encerrado no meio da gravação."""
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+    tmp.write_text(json.dumps(dados, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, caminho)
+
+
 def carregar_config():
-    if CONFIG_PATH.exists():
-        dados = json.loads(CONFIG_PATH.read_text())
-        return {**CONFIG_PADRAO, **dados}
-    return dict(CONFIG_PADRAO)
+    dados = _ler_json_seguro(CONFIG_PATH, dict)
+    combinado = {**CONFIG_PADRAO, **dados}
+    precisa_migrar = any(
+        combinado.get(chave) and not str(combinado.get(chave)).startswith("DPAPI:")
+        for chave in ("notif_email_senha_app", "notif_whatsapp_apikey")
+    )
+    try:
+        resultado = _desproteger_segredos_config(combinado)
+        if precisa_migrar and os.name == "nt":
+            try:
+                salvar_config(resultado)
+                _registrar_log("info", "Credenciais antigas migradas para proteção DPAPI.")
+            except Exception as e:
+                _registrar_log("warning", f"Não foi possível migrar credenciais para DPAPI: {e}")
+        return resultado
+    except Exception as e:
+        _registrar_log("error", f"Não foi possível descriptografar credenciais locais: {e}")
+        raise RuntimeError(
+            "Não foi possível ler as credenciais protegidas do config.json. "
+            "Se a conta do Windows mudou, será necessário informar as credenciais novamente."
+        ) from e
 
 
 def salvar_config(config):
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    _escrever_json_atomico(CONFIG_PATH, _proteger_segredos_config(config))
+
+
+MAX_REGISTROS_HISTORICO = 5000
+
+
+def podar_historico(historico):
+    """Mantém só os registros mais recentes, evitando crescimento indefinido."""
+    if len(historico) > MAX_REGISTROS_HISTORICO:
+        return historico[-MAX_REGISTROS_HISTORICO:]
+    return historico
 
 
 def carregar_historico():
-    if HISTORICO_PATH.exists():
-        return json.loads(HISTORICO_PATH.read_text())
-    return []
+    return _ler_json_seguro(HISTORICO_PATH, list)
 
 
 def salvar_historico(historico):
-    HISTORICO_PATH.write_text(json.dumps(historico, indent=2, ensure_ascii=False))
+    _escrever_json_atomico(HISTORICO_PATH, podar_historico(historico))
 
 
 def erro_indica_credencial_expirada(exc):
@@ -496,14 +679,86 @@ def mensagem_amigavel_excecao(exc, contexto=""):
         return prefixo + f"Falha ao executar o comando de impressão. {detalhe}"
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return prefixo + "Tempo esgotado na conexão. Verifique a internet e tente de novo."
-    if isinstance(exc, (ConnectionError, OSError)) and getattr(exc, "errno", None):
+    if isinstance(exc, PermissionError):
+        return prefixo + f"Sem permissão para acessar o arquivo/pasta: {getattr(exc, 'filename', '') or exc}"
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+        return prefixo + "Disco cheio — não há espaço suficiente para salvar o arquivo."
+    if isinstance(exc, ConnectionError):
         return prefixo + f"Falha de rede ({type(exc).__name__}): {exc}"
+    if isinstance(exc, OSError) and getattr(exc, "errno", None):
+        return prefixo + f"Erro de arquivo/disco ({type(exc).__name__}): {exc}"
     if isinstance(exc, HttpError):
         status = getattr(getattr(exc, "resp", None), "status", "?")
         return prefixo + f"Erro da API do Drive (HTTP {status}): {exc}"
     if isinstance(exc, GoogleAuthError):
         return prefixo + f"Erro de autenticação Google: {exc}"
     return prefixo + f"{type(exc).__name__}: {exc}"
+
+
+def autenticar_drive():
+    """Autentica no Google Drive e devolve o serviço pronto pra uso.
+    Lança CredencialExpirada quando o token precisa ser removido e
+    reautorizado, e FileNotFoundError quando falta credentials.json."""
+    creds = None
+    if TOKEN_PATH.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        except Exception as e:
+            raise CredencialExpirada(
+                f"Não foi possível ler token.json ({e}). Exclua o token e reinicie."
+            ) from e
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                raise CredencialExpirada(str(e)) from e
+        else:
+            if creds and not creds.valid:
+                raise CredencialExpirada(
+                    "O token salvo não é mais válido. Exclua token.json e reinicie."
+                )
+            if not os.path.exists("credentials.json"):
+                raise FileNotFoundError(
+                    "credentials.json não encontrado (veja instrucoes.txt)"
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", SCOPES
+            )
+            try:
+                creds = flow.run_local_server(
+                    host="127.0.0.1", port=0, timeout_seconds=TIMEOUT_OAUTH_SEGUNDOS
+                )
+            except Exception as e:
+                if "Timed out waiting for response" in str(e):
+                    raise TimeoutError(
+                        "A autorização do Google Drive expirou após "
+                        f"{TIMEOUT_OAUTH_SEGUNDOS}s sem retorno do navegador."
+                    ) from e
+                raise
+        with open(TOKEN_PATH, "w") as token:
+            token.write(creds.to_json())
+    return build("drive", "v3", credentials=creds)
+
+
+def testar_pasta_drive(folder_id):
+    """Confirma que a pasta existe e está acessível com a conta autorizada.
+    Devolve (True, nome_da_pasta) ou (False, mensagem_de_erro)."""
+    if not folder_id:
+        return False, "Informe o ID da pasta antes de testar."
+    try:
+        service = autenticar_drive()
+        info = service.files().get(
+            fileId=folder_id, fields="id, name, mimeType, trashed"
+        ).execute()
+    except Exception as e:
+        return False, mensagem_amigavel_excecao(e, "Falha ao testar a pasta")
+
+    if info.get("mimeType") != "application/vnd.google-apps.folder":
+        return False, f"O ID informado não é uma pasta (é '{info.get('mimeType')}')."
+    if info.get("trashed"):
+        return False, f"A pasta '{info.get('name')}' está na lixeira do Drive."
+    return True, info.get("name", "")
 
 
 class MotorImpressao:
@@ -516,8 +771,11 @@ class MotorImpressao:
         self._thread = None
         self.service = None
         self._ultima_notificacao = 0
+        self._espera_atual = POLL_INTERVAL_SECONDS
+        self._falhas_exclusao = {}
 
     def log(self, msg):
+        _registrar_log("info", msg)
         self.eventos.put(("log", msg))
 
     def status(self, msg):
@@ -547,36 +805,7 @@ class MotorImpressao:
         self._parar.set()
 
     def _autenticar(self):
-        creds = None
-        if TOKEN_PATH.exists():
-            try:
-                creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-            except Exception as e:
-                raise CredencialExpirada(
-                    f"Não foi possível ler token.json ({e}). Exclua o token e reinicie."
-                ) from e
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except Exception as e:
-                    raise CredencialExpirada(str(e)) from e
-            else:
-                if creds and not creds.valid:
-                    raise CredencialExpirada(
-                        "O token salvo não é mais válido. Exclua token.json e reinicie."
-                    )
-                if not os.path.exists("credentials.json"):
-                    raise FileNotFoundError(
-                        "credentials.json não encontrado (veja instrucoes.txt)"
-                    )
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    "credentials.json", SCOPES
-                )
-                creds = flow.run_local_server(port=0)
-            with open(TOKEN_PATH, "w") as token:
-                token.write(creds.to_json())
-        return build("drive", "v3", credentials=creds)
+        return autenticar_drive()
 
     def _listar_pdfs(self):
         query = (
@@ -618,9 +847,16 @@ class MotorImpressao:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=TIMEOUT_IMPRESSAO_SEGUNDOS,
+                **_opcoes_processo_sem_janela(),
             )
         except FileNotFoundError as e:
             raise FileNotFoundError(f"SumatraPDF não encontrado em: {sumatra}") from e
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(
+                f"A impressão de '{Path(caminho_pdf).name}' excedeu o limite de "
+                f"{TIMEOUT_IMPRESSAO_SEGUNDOS}s. Verifique a impressora, papel ou filas de impressão."
+            ) from e
         except subprocess.CalledProcessError as e:
             detalhe = (e.stderr or e.stdout or "").strip() or str(e)
             raise RuntimeError(
@@ -659,6 +895,8 @@ class MotorImpressao:
         for arquivo in arquivos:
             if arquivo["id"] not in impressos_ids:
                 continue
+            if self._falhas_exclusao.get(arquivo["id"], 0) >= MAX_TENTATIVAS_EXCLUSAO:
+                continue
 
             modificado_str = arquivo.get("modifiedTime")
             if not modificado_str:
@@ -680,10 +918,15 @@ class MotorImpressao:
         try:
             self.service.files().update(fileId=file_id, body={"trashed": True}).execute()
             self.log(f"Movido para a lixeira do Drive (arquivo antigo): {nome}")
+            self._falhas_exclusao.pop(file_id, None)
         except Exception as e:
             if erro_indica_credencial_expirada(e):
                 raise CredencialExpirada(str(e)) from e
-            self.log(mensagem_amigavel_excecao(e, f"Erro ao mover '{nome}' para a lixeira do Drive"))
+            tentativas = self._falhas_exclusao.get(file_id, 0) + 1
+            self._falhas_exclusao[file_id] = tentativas
+            sufixo = f" (tentativa {tentativas}/{MAX_TENTATIVAS_EXCLUSAO}"
+            sufixo += ", desistindo)" if tentativas >= MAX_TENTATIVAS_EXCLUSAO else ")"
+            self.log(mensagem_amigavel_excecao(e, f"Erro ao mover '{nome}' para a lixeira do Drive{sufixo}"))
 
     def _notificar_falha(self, mensagem):
         agora = time.time()
@@ -706,7 +949,9 @@ class MotorImpressao:
             msg["To"] = destino
 
             contexto = ssl.create_default_context()
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=contexto) as servidor:
+            with smtplib.SMTP_SSL(
+                "smtp.gmail.com", 465, timeout=TIMEOUT_SMTP_SEGUNDOS, context=contexto
+            ) as servidor:
                 servidor.login(remetente, self.config["notif_email_senha_app"])
                 servidor.sendmail(remetente, [destino], msg.as_string())
             self.log("Notificação de falha enviada por e-mail.")
@@ -721,7 +966,13 @@ class MotorImpressao:
                 f"phone={self.config['notif_whatsapp_telefone']}"
                 f"&text={texto}&apikey={self.config['notif_whatsapp_apikey']}"
             )
-            urllib.request.urlopen(url, timeout=10)
+            resposta = urllib.request.urlopen(url, timeout=10)
+            corpo = resposta.read().decode("utf-8", errors="replace")
+            corpo_lower = corpo.lower()
+            # CallMeBot devolve HTTP 200 mesmo quando falha (apikey errada,
+            # número não autorizado, etc.) — o motivo real vem só no corpo.
+            if "error" in corpo_lower or "apikey is invalid" in corpo_lower:
+                raise RuntimeError(f"CallMeBot recusou o envio: {corpo.strip()[:200]}")
             self.log("Notificação de falha enviada por WhatsApp.")
         except Exception as e:
             self.log(mensagem_amigavel_excecao(e, "Erro ao enviar WhatsApp de notificação"))
@@ -797,10 +1048,19 @@ class MotorImpressao:
                 if erro_indica_credencial_expirada(e):
                     self._sinalizar_credencial_expirada(str(e))
                     return
-                self.log(mensagem_amigavel_excecao(e, "Erro ao consultar o Drive"))
-                self._notificar_falha(mensagem_amigavel_excecao(e, "Erro ao consultar o Google Drive"))
+                if isinstance(e, HttpError) and getattr(getattr(e, "resp", None), "status", None) == 429:
+                    self._espera_atual = min(self._espera_atual * 2, MAX_BACKOFF_SEGUNDOS)
+                    self.log(
+                        f"Cota da API do Google Drive atingida (HTTP 429). "
+                        f"Aguardando {self._espera_atual}s antes de tentar de novo."
+                    )
+                else:
+                    self.log(mensagem_amigavel_excecao(e, "Erro ao consultar o Drive"))
+                    self._notificar_falha(mensagem_amigavel_excecao(e, "Erro ao consultar o Google Drive"))
+            else:
+                self._espera_atual = POLL_INTERVAL_SECONDS  # ciclo OK: zera o backoff
 
-            for restante in range(POLL_INTERVAL_SECONDS, 0, -1):
+            for restante in range(self._espera_atual, 0, -1):
                 if self._parar.is_set():
                     break
                 self.proxima_checagem(restante)
@@ -808,6 +1068,19 @@ class MotorImpressao:
 
         self.proxima_checagem(None)
         self.log("Monitoramento parado.")
+
+
+def _criar_icone_tray():
+    if Image is None or ImageDraw is None:
+        return None
+    imagem = Image.new("RGBA", (64, 64), (24, 28, 38, 255))
+    desenho = ImageDraw.Draw(imagem)
+    desenho.rounded_rectangle((8, 8, 56, 56), radius=12, fill=(78, 145, 255, 255))
+    desenho.rounded_rectangle((18, 16, 46, 48), radius=4, fill=(240, 244, 250, 255))
+    desenho.rectangle((23, 22, 41, 25), fill=(78, 145, 255, 255))
+    desenho.rectangle((23, 29, 41, 32), fill=(78, 145, 255, 255))
+    desenho.rectangle((23, 36, 36, 39), fill=(78, 145, 255, 255))
+    return imagem
 
 
 class App(tk.Tk):
@@ -824,12 +1097,74 @@ class App(tk.Tk):
         self.rodando = False
         self._credencial_expirada = False
         self._aba_ativa = "monitor"
+        self._tray_icon = None
+        self._tray_thread = None
+        self._janela_oculta = False
+        self.protocol("WM_DELETE_WINDOW", self._fechar_janela)
 
         self._configurar_estilo()
         self._montar_interface()
         self._atualizar_contador_hoje()
         self.after(200, self._processar_eventos)
         self.after(80, lambda: aplicar_efeito_vidro(self))
+
+    def _iniciar_tray(self):
+        if pystray is None or self._tray_icon is not None:
+            return
+        imagem = _criar_icone_tray()
+        if imagem is None:
+            _registrar_log("warning", "System Tray indisponível: instale pystray e Pillow para ativá-lo.")
+            return
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir", lambda icon, item: self.after(0, self._restaurar_janela)),
+            pystray.MenuItem("Parar monitoramento", lambda icon, item: self.after(0, self._parar)),
+            pystray.MenuItem("Sair", lambda icon, item: self.after(0, self._sair_definitivo)),
+        )
+        self._tray_icon = pystray.Icon("etiquetas", imagem, "Etiquetas", menu)
+        self._tray_thread = threading.Thread(target=self._tray_icon.run, daemon=True)
+        self._tray_thread.start()
+        _registrar_log("info", "System Tray iniciado.")
+
+    def _ocultar_para_tray(self):
+        self._iniciar_tray()
+        if self._tray_icon is None:
+            # Sem pystray/Pillow, preserva a janela na barra de tarefas em vez
+            # de usar withdraw(), que deixaria o usuário sem forma de restaurá-la.
+            self.iconify()
+            _registrar_log("warning", "System Tray indisponível; janela minimizada normalmente.")
+            return
+        self.withdraw()
+        self._janela_oculta = True
+        _registrar_log("info", "Aplicação minimizada para a área de notificação.")
+
+    def _restaurar_janela(self):
+        if not self._janela_oculta:
+            return
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+        self._janela_oculta = False
+        _registrar_log("info", "Aplicação restaurada da área de notificação.")
+
+    def _sair_definitivo(self):
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+        if self.motor:
+            self.motor.parar()
+        _registrar_log("info", "Aplicação encerrada pelo usuário.")
+        self.destroy()
+
+    def _fechar_janela(self):
+        if self.rodando:
+            self._ocultar_para_tray()
+        else:
+            self._sair_definitivo()
 
     def _configurar_estilo(self):
         style = ttk.Style(self)
@@ -1080,6 +1415,11 @@ class App(tk.Tk):
         self.var_sumatra = tk.StringVar(value=self.config_dados["sumatra_path"])
 
         self._campo(card_config, "ID da pasta no Drive", self.var_folder)
+        self.btn_testar_pasta = BotaoArredondado(
+            card_config, "Testar pasta do Drive", self._testar_pasta,
+            primario=False, fundo=COR_CARD,
+        )
+        self.btn_testar_pasta.pack(anchor="w", pady=(2, 10))
         self._campo(card_config, "Nome da impressora térmica", self.var_printer)
         self._campo(card_config, "Caminho do SumatraPDF.exe", self.var_sumatra)
 
@@ -1193,6 +1533,30 @@ class App(tk.Tk):
         tk.Label(frame, text=label, bg=COR_CARD, fg=COR_TEXTO_MUTED, font=(FONTE_UI, 9)).pack(anchor="w")
         ttk.Entry(frame, textvariable=var, show="*" if senha else "", style="Glass.TEntry").pack(fill="x", pady=(4, 0))
 
+    def _testar_pasta(self):
+        folder_id = self.var_folder.get().strip()
+        if not folder_id:
+            messagebox.showwarning("Testar pasta", "Preencha o ID da pasta antes de testar.")
+            return
+
+        self.btn_testar_pasta.config_estado("disabled")
+
+        def trabalhar():
+            try:
+                ok, resultado = testar_pasta_drive(folder_id)
+            except Exception as e:
+                ok, resultado = False, mensagem_amigavel_excecao(e, "Falha no teste")
+            self.after(0, lambda: self._mostrar_resultado_teste_pasta(ok, resultado))
+
+        threading.Thread(target=trabalhar, daemon=True).start()
+
+    def _mostrar_resultado_teste_pasta(self, ok, resultado):
+        self.btn_testar_pasta.config_estado("normal")
+        if ok:
+            messagebox.showinfo("Pasta encontrada", f"Conectado com sucesso à pasta '{resultado}'.")
+        else:
+            messagebox.showerror("Falha no teste", resultado)
+
     def _salvar(self):
         try:
             dias_exclusao = int(self.var_dias_exclusao.get().strip())
@@ -1202,6 +1566,49 @@ class App(tk.Tk):
             messagebox.showwarning(
                 "Configuração inválida",
                 "O número de dias para exclusão deve ser um número inteiro maior que zero.",
+            )
+            return
+
+        if self.var_notif_email.get():
+            remetente = self.var_email_remetente.get().strip()
+            destino = self.var_email_destino.get().strip()
+            if not _validar_email(remetente) or not _validar_email(destino):
+                messagebox.showwarning(
+                    "Configuração inválida",
+                    "Informe um e-mail válido no remetente e no destinatário.",
+                )
+                return
+
+        if self.var_notif_whatsapp.get():
+            telefone = self.var_whatsapp_telefone.get().strip()
+            if not _validar_telefone_callmebot(telefone):
+                messagebox.showwarning(
+                    "Configuração inválida",
+                    "O telefone do CallMeBot deve conter somente dígitos, com código do país, "
+                    "e ter entre 10 e 15 dígitos.",
+                )
+                return
+
+        if self.var_notif_email.get() and not all((
+            self.var_email_remetente.get().strip(),
+            self.var_email_senha.get().strip(),
+            self.var_email_destino.get().strip(),
+        )):
+            messagebox.showwarning(
+                "Configuração incompleta",
+                "O alerta por e-mail está ativado, mas falta preencher o "
+                "Gmail remetente, a senha de app ou o e-mail de destino.",
+            )
+            return
+
+        if self.var_notif_whatsapp.get() and not all((
+            self.var_whatsapp_telefone.get().strip(),
+            self.var_whatsapp_apikey.get().strip(),
+        )):
+            messagebox.showwarning(
+                "Configuração incompleta",
+                "O alerta por WhatsApp está ativado, mas falta preencher o "
+                "telefone ou a apikey do CallMeBot.",
             )
             return
 
@@ -1259,13 +1666,15 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Token", f"Não foi possível excluir o token.json:\n{e}")
             return
-        self._adicionar_log("token.json excluído. Reinicie o aplicativo para autorizar de novo.")
+        mensagem = "token.json excluído. Reinicie o aplicativo para autorizar de novo."
+        _registrar_log("info", mensagem)
+        self._adicionar_log(mensagem)
         fechar = messagebox.askyesno(
             "Token excluído",
             "token.json foi excluído.\n\nDeseja fechar o aplicativo agora para reiniciar?",
         )
         if fechar:
-            self.destroy()
+            self._sair_definitivo()
 
     def _iniciar(self):
         if self._credencial_expirada and TOKEN_PATH.exists():
@@ -1364,7 +1773,23 @@ class App(tk.Tk):
         self.after(200, self._processar_eventos)
 
 
+def _esconder_console_proprio():
+    """Se o programa foi aberto com python.exe (em vez de pythonw.exe), uma
+    janela de prompt fica aberta atrás da interface. Esconde ela aqui, sem
+    depender de como o usuário deu o duplo clique no arquivo."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        janela_console = ctypes.windll.kernel32.GetConsoleWindow()
+        if janela_console:
+            ctypes.windll.user32.ShowWindow(janela_console, 0)  # SW_HIDE
+    except Exception:
+        pass  # não é crítico — melhor seguir sem esconder do que travar o app
+
+
 if __name__ == "__main__":
+    _esconder_console_proprio()
     trava = obter_trava_instancia()
     if trava is None:
         raiz_temp = tk.Tk()
